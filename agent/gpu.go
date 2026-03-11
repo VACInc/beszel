@@ -460,7 +460,7 @@ func (gm *GPUManager) discoverGpuCapabilities() gpuCapabilities {
 	if _, err := exec.LookPath(nvtopCmd); err == nil {
 		caps.hasNvtop = true
 	}
-	if runtime.GOOS == "darwin" {
+	if supportsAppleGPUCollection() {
 		if _, err := exec.LookPath(macmonCmd); err == nil {
 			caps.hasMacmon = true
 		}
@@ -473,6 +473,10 @@ func (gm *GPUManager) discoverGpuCapabilities() gpuCapabilities {
 
 func hasAnyGpuCollector(caps gpuCapabilities) bool {
 	return caps.hasNvidiaSmi || caps.hasRocmSmi || caps.hasAmdSysfs || caps.hasTegrastats || caps.hasIntelGpuTop || caps.hasNvtop || caps.hasMacmon || caps.hasPowermetrics
+}
+
+func supportsAppleGPUCollection() bool {
+	return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
 }
 
 func (gm *GPUManager) startIntelCollector() {
@@ -709,16 +713,11 @@ func (gm *GPUManager) resolveLegacyCollectorPriority(caps gpuCapabilities) []col
 		priorities = append(priorities, collectorSourceIntelGpuTop)
 	}
 
-	// Apple collectors are currently opt-in only for testing.
-	// Enable them with GPU_COLLECTOR=macmon or GPU_COLLECTOR=powermetrics.
-	// TODO: uncomment below when Apple collectors are confirmed to be working.
-	//
-	// Prefer macmon on macOS (no sudo). Fall back to powermetrics if present.
-	// if caps.hasMacmon {
-	// 	priorities = append(priorities, collectorSourceMacmon)
-	// } else if caps.hasPowermetrics {
-	// 	priorities = append(priorities, collectorSourcePowermetrics)
-	// }
+	// Prefer macmon on Apple Silicon because it works without root.
+	// Keep powermetrics as an explicit opt-in since it requires elevated privileges.
+	if supportsAppleGPUCollection() && caps.hasMacmon {
+		priorities = append(priorities, collectorSourceMacmon)
+	}
 
 	// Keep nvtop as a last resort only when no vendor collector exists.
 	if len(priorities) == 0 && caps.hasNvtop {

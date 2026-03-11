@@ -3,7 +3,11 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/henrygd/beszel/internal/entities/system"
 	"github.com/stretchr/testify/assert"
@@ -78,4 +82,65 @@ func TestParseMacmonLine(t *testing.T) {
 	assert.InDelta(t, 0.011824, g0.Power, 0.0005)
 	assert.InDelta(t, 29.445, g0.Temperature, 0.01)
 	assert.Equal(t, 1.0, g0.Count)
+}
+
+func TestResolveLegacyCollectorPriorityPrefersMacmon(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("Apple GPU auto-selection is only enabled on arm64")
+	}
+
+	gm := &GPUManager{}
+	priorities := gm.resolveLegacyCollectorPriority(gpuCapabilities{
+		hasMacmon:       true,
+		hasPowermetrics: true,
+	})
+
+	assert.Equal(t, []collectorSource{collectorSourceMacmon}, priorities)
+}
+
+func TestResolveLegacyCollectorPriorityDoesNotAutoUsePowermetrics(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("Apple GPU auto-selection is only enabled on arm64")
+	}
+
+	gm := &GPUManager{}
+	priorities := gm.resolveLegacyCollectorPriority(gpuCapabilities{
+		hasPowermetrics: true,
+	})
+
+	assert.Empty(t, priorities)
+}
+
+func TestNewGPUManagerAutoStartsMacmonOnAppleSilicon(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("Apple GPU auto-selection is only enabled on arm64")
+	}
+
+	origPath := os.Getenv("PATH")
+	defer os.Setenv("PATH", origPath)
+
+	dir := t.TempDir()
+	os.Setenv("PATH", dir)
+
+	macmonPath := filepath.Join(dir, macmonCmd)
+	macmonScript := `#!/bin/sh
+echo '{"gpu_power":0.010859241709113121,"gpu_ram_power":0.000965250947047025,"gpu_usage":[503,0.013633215799927711],"temp":{"gpu_temp_avg":29.44516944885254}}'
+`
+	require.NoError(t, os.WriteFile(macmonPath, []byte(macmonScript), 0755))
+
+	gm, err := NewGPUManager()
+	require.NoError(t, err)
+	require.NotNil(t, gm)
+
+	require.Eventually(t, func() bool {
+		gpu, ok := gm.GpuDataMap[appleGPUID]
+		return ok && gpu.Count > 0
+	}, time.Second, 25*time.Millisecond)
+
+	gpu := gm.GpuDataMap[appleGPUID]
+	require.NotNil(t, gpu)
+	assert.Equal(t, "Apple GPU", gpu.Name)
+	assert.InDelta(t, 1.3633, gpu.Usage, 0.05)
+	assert.InDelta(t, 0.011824, gpu.Power, 0.0005)
+	assert.InDelta(t, 29.445, gpu.Temperature, 0.01)
 }
