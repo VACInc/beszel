@@ -166,6 +166,97 @@ func TestUserAlertsApi(t *testing.T) {
 			},
 		},
 		{
+			Name:   "POST valid status online alert data",
+			Method: http.MethodPost,
+			URL:    "/api/beszel/user-alerts",
+			Headers: map[string]string{
+				"Authorization": user1Token,
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{"\"success\":true"},
+			TestAppFactory:  testAppFactory,
+			Body: jsonReader(map[string]any{
+				"name":    "StatusOnline",
+				"systems": []string{system1.Id},
+				"value":   1440,
+				"min":     0,
+			}),
+			BeforeTestFunc: func(t testing.TB, app *pbTests.TestApp, e *core.ServeEvent) {
+				beszelTests.ClearCollection(t, app, "alerts")
+			},
+			AfterTestFunc: func(t testing.TB, app *pbTests.TestApp, res *http.Response) {
+				alerts, _ := app.CountRecords("alerts")
+				assert.EqualValues(t, 2, alerts, "should have 2 paired status alerts")
+				alert, _ := app.FindFirstRecordByFilter("alerts", "name = 'StatusOnline' && user = {:user}", dbx.Params{"user": user1.Id})
+				assert.EqualValues(t, 1440, alert.Get("value"), "should have 1440 as value")
+				assert.EqualValues(t, 0, alert.Get("min"), "should have 0 as min")
+				pairedAlert, _ := app.FindFirstRecordByFilter("alerts", "name = 'Status' && user = {:user}", dbx.Params{"user": user1.Id})
+				assert.EqualValues(t, 1, pairedAlert.Get("min"), "paired down alert should default to 1 minute")
+			},
+		},
+		{
+			Name:   "POST valid status down alert data creates paired online alert",
+			Method: http.MethodPost,
+			URL:    "/api/beszel/user-alerts",
+			Headers: map[string]string{
+				"Authorization": user1Token,
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{"\"success\":true"},
+			TestAppFactory:  testAppFactory,
+			Body: jsonReader(map[string]any{
+				"name":    "Status",
+				"systems": []string{system1.Id},
+				"value":   0,
+				"min":     0,
+			}),
+			BeforeTestFunc: func(t testing.TB, app *pbTests.TestApp, e *core.ServeEvent) {
+				beszelTests.ClearCollection(t, app, "alerts")
+			},
+			AfterTestFunc: func(t testing.TB, app *pbTests.TestApp, res *http.Response) {
+				alerts, _ := app.CountRecords("alerts")
+				assert.EqualValues(t, 2, alerts, "should have 2 paired status alerts")
+				downAlert, _ := app.FindFirstRecordByFilter("alerts", "name = 'Status' && user = {:user}", dbx.Params{"user": user1.Id})
+				assert.EqualValues(t, 1, downAlert.Get("min"), "down alert should normalize to 1 minute")
+				onlineAlert, _ := app.FindFirstRecordByFilter("alerts", "name = 'StatusOnline' && user = {:user}", dbx.Params{"user": user1.Id})
+				assert.EqualValues(t, 0, onlineAlert.Get("value"), "paired online alert should default to 0 minutes")
+			},
+		},
+		{
+			Name:   "POST status alert does not overwrite existing paired online alert",
+			Method: http.MethodPost,
+			URL:    "/api/beszel/user-alerts",
+			Headers: map[string]string{
+				"Authorization": user1Token,
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{"\"success\":true"},
+			TestAppFactory:  testAppFactory,
+			Body: jsonReader(map[string]any{
+				"name":      "Status",
+				"systems":   []string{system1.Id},
+				"value":     0,
+				"min":       0,
+				"overwrite": true,
+			}),
+			BeforeTestFunc: func(t testing.TB, app *pbTests.TestApp, e *core.ServeEvent) {
+				beszelTests.ClearCollection(t, app, "alerts")
+				beszelTests.CreateRecord(app, "alerts", map[string]any{
+					"name":   "StatusOnline",
+					"system": system1.Id,
+					"user":   user1.Id,
+					"value":  1440,
+					"min":    0,
+				})
+			},
+			AfterTestFunc: func(t testing.TB, app *pbTests.TestApp, res *http.Response) {
+				alerts, _ := app.CountRecords("alerts")
+				assert.EqualValues(t, 2, alerts, "should have 2 paired status alerts")
+				onlineAlert, _ := app.FindFirstRecordByFilter("alerts", "name = 'StatusOnline' && user = {:user}", dbx.Params{"user": user1.Id})
+				assert.EqualValues(t, 1440, onlineAlert.Get("value"), "existing online delay should be preserved")
+			},
+		},
+		{
 			Name:   "Overwrite: false, should not overwrite existing alert",
 			Method: http.MethodPost,
 			URL:    "/api/beszel/user-alerts",
@@ -320,6 +411,42 @@ func TestUserAlertsApi(t *testing.T) {
 			AfterTestFunc: func(t testing.TB, app *pbTests.TestApp, res *http.Response) {
 				alerts, _ := app.CountRecords("alerts")
 				assert.Zero(t, alerts, "should have 0 alerts")
+			},
+		},
+		{
+			Name:   "DELETE status online alert",
+			Method: http.MethodDelete,
+			URL:    "/api/beszel/user-alerts",
+			Headers: map[string]string{
+				"Authorization": user1Token,
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{"\"count\":1", "\"success\":true"},
+			TestAppFactory:  testAppFactory,
+			Body: jsonReader(map[string]any{
+				"name":    "StatusOnline",
+				"systems": []string{system1.Id},
+			}),
+			BeforeTestFunc: func(t testing.TB, app *pbTests.TestApp, e *core.ServeEvent) {
+				beszelTests.ClearCollection(t, app, "alerts")
+				beszelTests.CreateRecord(app, "alerts", map[string]any{
+					"name":   "StatusOnline",
+					"system": system1.Id,
+					"user":   user1.Id,
+					"value":  1440,
+					"min":    0,
+				})
+				beszelTests.CreateRecord(app, "alerts", map[string]any{
+					"name":   "Status",
+					"system": system1.Id,
+					"user":   user1.Id,
+					"value":  0,
+					"min":    1,
+				})
+			},
+			AfterTestFunc: func(t testing.TB, app *pbTests.TestApp, res *http.Response) {
+				alerts, _ := app.CountRecords("alerts")
+				assert.EqualValues(t, 1, alerts, "paired down alert should remain")
 			},
 		},
 		{

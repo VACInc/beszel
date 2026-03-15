@@ -91,8 +91,8 @@ func TestStatusAlerts(t *testing.T) {
 		triggeredCount, err = hub.CountRecords("alerts", dbx.HashExp{"triggered": true})
 		assert.NoError(t, err)
 		assert.Zero(t, triggeredCount, "should have 0 alert triggered")
-		// 4 messages sent, 2 down alerts and 2 up alerts for first 2 systems
-		assert.EqualValues(t, 4, hub.TestMailer.TotalSend(), "should have 4 messages sent")
+		// 2 messages sent: only the down alerts for the first 2 systems
+		assert.EqualValues(t, 2, hub.TestMailer.TotalSend(), "should have 2 messages sent")
 	})
 }
 func TestStatusAlertRecoveryBeforeDeadline(t *testing.T) {
@@ -113,7 +113,9 @@ func TestStatusAlertRecoveryBeforeDeadline(t *testing.T) {
 	system.Set("status", "up")
 	system.Set("host", "127.0.0.1")
 	system.Set("users", []string{user.Id})
-	hub.Save(system)
+	require.NoError(t, hub.Save(system))
+	system.Set("status", "up")
+	require.NoError(t, hub.SaveNoValidate(system))
 
 	alertCollection, _ := hub.FindCollectionByNameOrId("alerts")
 	alert := core.NewRecord(alertCollection)
@@ -156,7 +158,9 @@ func TestStatusAlertNormalRecovery(t *testing.T) {
 	system.Set("status", "up")
 	system.Set("host", "127.0.0.1")
 	system.Set("users", []string{user.Id})
-	hub.Save(system)
+	require.NoError(t, hub.Save(system))
+	system.Set("status", "up")
+	require.NoError(t, hub.SaveNoValidate(system))
 
 	alertCollection, _ := hub.FindCollectionByNameOrId("alerts")
 	alert := core.NewRecord(alertCollection)
@@ -164,7 +168,15 @@ func TestStatusAlertNormalRecovery(t *testing.T) {
 	alert.Set("system", system.Id)
 	alert.Set("name", "Status")
 	alert.Set("triggered", true) // System was confirmed DOWN
-	hub.Save(alert)
+	require.NoError(t, hub.Save(alert))
+
+	onlineAlert := core.NewRecord(alertCollection)
+	onlineAlert.Set("user", user.Id)
+	onlineAlert.Set("system", system.Id)
+	onlineAlert.Set("name", "StatusOnline")
+	onlineAlert.Set("value", 1)
+	onlineAlert.Set("min", 1)
+	require.NoError(t, hub.Save(onlineAlert))
 
 	am := hub.AlertManager
 	initialEmailCount := hub.TestMailer.TotalSend()
@@ -172,9 +184,255 @@ func TestStatusAlertNormalRecovery(t *testing.T) {
 	// System goes up
 	am.HandleStatusAlerts("up", system)
 
-	// Verify that an email WAS sent (normal recovery).
-	assert.Equal(t, initialEmailCount+1, hub.TestMailer.TotalSend(), "Recovery notification should be sent if system was triggered as down")
+	assert.Equal(t, 1, am.GetPendingAlertsCount(), "online notification should be scheduled when enabled")
 
+	am.ForceExpirePendingAlerts()
+	processed, err := am.ProcessPendingAlerts()
+	require.NoError(t, err)
+	assert.Len(t, processed, 1, "scheduled online notification should be processed")
+
+	// Verify that an email WAS sent after the online delay.
+	assert.Equal(t, initialEmailCount+1, hub.TestMailer.TotalSend(), "Recovery notification should be sent after the configured online delay")
+
+}
+
+func TestStatusAlertTriggeredRecoveryWithoutOnlineAlertDoesNotNotify(t *testing.T) {
+	hub, user := beszelTests.GetHubWithUser(t)
+	defer hub.Cleanup()
+
+	userSettings, _ := hub.FindFirstRecordByFilter("user_settings", "user={:user}", map[string]any{"user": user.Id})
+	userSettings.Set("settings", `{"emails":["test@example.com"],"webhooks":[]}`)
+	hub.Save(userSettings)
+
+	systemCollection, _ := hub.FindCollectionByNameOrId("systems")
+	system := core.NewRecord(systemCollection)
+	system.Set("name", "test-system")
+	system.Set("status", "up")
+	system.Set("host", "127.0.0.1")
+	system.Set("users", []string{user.Id})
+	hub.Save(system)
+
+	alertCollection, _ := hub.FindCollectionByNameOrId("alerts")
+	alert := core.NewRecord(alertCollection)
+	alert.Set("user", user.Id)
+	alert.Set("system", system.Id)
+	alert.Set("name", "Status")
+	alert.Set("triggered", true)
+	hub.Save(alert)
+
+	initialEmailCount := hub.TestMailer.TotalSend()
+	am := alerts.NewTestAlertManagerWithoutWorker(hub)
+
+	am.HandleStatusAlerts("up", system)
+
+	assert.Equal(t, initialEmailCount, hub.TestMailer.TotalSend(), "Recovery notification should not be sent when online alerts are disabled")
+	assert.Zero(t, am.GetPendingAlertsCount(), "No pending online notification should be scheduled when online alerts are disabled")
+
+	alertRecord, err := hub.FindRecordById("alerts", alert.Id)
+	require.NoError(t, err)
+	assert.False(t, alertRecord.GetBool("triggered"), "Triggered status alert should still resolve when system comes back up")
+}
+
+func TestStatusAlertOnlineNotificationAfterBriefOutage(t *testing.T) {
+	hub, user := beszelTests.GetHubWithUser(t)
+	defer hub.Cleanup()
+
+	userSettings, err := hub.FindFirstRecordByFilter("user_settings", "user={:user}", map[string]any{"user": user.Id})
+	require.NoError(t, err)
+	userSettings.Set("settings", `{"emails":["test@example.com"],"webhooks":[]}`)
+	require.NoError(t, hub.Save(userSettings))
+
+	systemCollection, err := hub.FindCollectionByNameOrId("systems")
+	require.NoError(t, err)
+	system := core.NewRecord(systemCollection)
+	system.Set("name", "test-system")
+	system.Set("status", "up")
+	system.Set("host", "127.0.0.1")
+	system.Set("users", []string{user.Id})
+	require.NoError(t, hub.Save(system))
+
+	alertCollection, err := hub.FindCollectionByNameOrId("alerts")
+	require.NoError(t, err)
+	alert := core.NewRecord(alertCollection)
+	alert.Set("user", user.Id)
+	alert.Set("system", system.Id)
+	alert.Set("name", "Status")
+	alert.Set("triggered", false)
+	alert.Set("min", 5)
+	require.NoError(t, hub.Save(alert))
+
+	onlineAlert := core.NewRecord(alertCollection)
+	onlineAlert.Set("user", user.Id)
+	onlineAlert.Set("system", system.Id)
+	onlineAlert.Set("name", "StatusOnline")
+	onlineAlert.Set("value", 1)
+	onlineAlert.Set("min", 1)
+	require.NoError(t, hub.Save(onlineAlert))
+
+	initialEmailCount := hub.TestMailer.TotalSend()
+	am := alerts.NewTestAlertManagerWithoutWorker(hub)
+
+	system.Set("status", "down")
+	require.NoError(t, hub.Save(system))
+	require.NoError(t, am.HandleStatusAlerts("down", system))
+	assert.Equal(t, 1, am.GetPendingAlertsCount(), "down transition should register a pending offline alert")
+
+	system.Set("status", "up")
+	require.NoError(t, hub.Save(system))
+	require.NoError(t, am.HandleStatusAlerts("up", system))
+	assert.Equal(t, 1, am.GetPendingAlertsCount(), "up transition should replace the pending offline alert with an online notification")
+
+	am.ForceExpirePendingAlerts()
+	processed, err := am.ProcessPendingAlerts()
+	require.NoError(t, err)
+	assert.Len(t, processed, 1, "online notification should process after the configured delay")
+	assert.Equal(t, initialEmailCount+1, hub.TestMailer.TotalSend(), "online notification should be sent after a brief outage when enabled")
+}
+
+func TestStatusAlertDownZeroDelayNormalizesToOneMinute(t *testing.T) {
+	hub, user := beszelTests.GetHubWithUser(t)
+	defer hub.Cleanup()
+
+	userSettings, err := hub.FindFirstRecordByFilter("user_settings", "user={:user}", map[string]any{"user": user.Id})
+	require.NoError(t, err)
+	userSettings.Set("settings", `{"emails":["test@example.com"],"webhooks":[]}`)
+	require.NoError(t, hub.Save(userSettings))
+
+	systemCollection, err := hub.FindCollectionByNameOrId("systems")
+	require.NoError(t, err)
+	system := core.NewRecord(systemCollection)
+	system.Set("name", "test-system")
+	system.Set("status", "up")
+	system.Set("host", "127.0.0.1")
+	system.Set("users", []string{user.Id})
+	require.NoError(t, hub.Save(system))
+
+	alertCollection, err := hub.FindCollectionByNameOrId("alerts")
+	require.NoError(t, err)
+	alert := core.NewRecord(alertCollection)
+	alert.Set("user", user.Id)
+	alert.Set("system", system.Id)
+	alert.Set("name", "Status")
+	alert.Set("triggered", false)
+	alert.Set("min", 0)
+	require.NoError(t, hub.Save(alert))
+
+	initialEmailCount := hub.TestMailer.TotalSend()
+	am := alerts.NewTestAlertManagerWithoutWorker(hub)
+
+	system.Set("status", "down")
+	require.NoError(t, hub.Save(system))
+	require.NoError(t, am.HandleStatusAlerts("down", system))
+	assert.Equal(t, 1, am.GetPendingAlertsCount(), "invalid zero-minute down alerts should still schedule a pending alert")
+	assert.Equal(t, initialEmailCount, hub.TestMailer.TotalSend(), "down alerts should not send immediately when min is zero")
+
+	am.ForceExpirePendingAlerts()
+	processed, err := am.ProcessPendingAlerts()
+	require.NoError(t, err)
+	assert.Len(t, processed, 1, "normalized down alert should be processed after the minimum delay")
+	assert.Equal(t, initialEmailCount+1, hub.TestMailer.TotalSend(), "zero-minute down alerts should normalize to the minimum delay")
+
+	alertRecord, err := hub.FindRecordById("alerts", alert.Id)
+	require.NoError(t, err)
+	assert.True(t, alertRecord.GetBool("triggered"), "normalized down alert should be marked triggered once delivered")
+}
+
+func TestStatusAlertOnlineZeroDelaySendsImmediately(t *testing.T) {
+	hub, user := beszelTests.GetHubWithUser(t)
+	defer hub.Cleanup()
+
+	userSettings, err := hub.FindFirstRecordByFilter("user_settings", "user={:user}", map[string]any{"user": user.Id})
+	require.NoError(t, err)
+	userSettings.Set("settings", `{"emails":["test@example.com"],"webhooks":[]}`)
+	require.NoError(t, hub.Save(userSettings))
+
+	systemCollection, err := hub.FindCollectionByNameOrId("systems")
+	require.NoError(t, err)
+	system := core.NewRecord(systemCollection)
+	system.Set("name", "test-system")
+	system.Set("status", "up")
+	system.Set("host", "127.0.0.1")
+	system.Set("users", []string{user.Id})
+	require.NoError(t, hub.Save(system))
+
+	alertCollection, err := hub.FindCollectionByNameOrId("alerts")
+	require.NoError(t, err)
+	downAlert := core.NewRecord(alertCollection)
+	downAlert.Set("user", user.Id)
+	downAlert.Set("system", system.Id)
+	downAlert.Set("name", "Status")
+	downAlert.Set("triggered", true)
+	require.NoError(t, hub.Save(downAlert))
+
+	onlineAlert := core.NewRecord(alertCollection)
+	onlineAlert.Set("user", user.Id)
+	onlineAlert.Set("system", system.Id)
+	onlineAlert.Set("name", "StatusOnline")
+	onlineAlert.Set("value", 0)
+	onlineAlert.Set("min", 0)
+	require.NoError(t, hub.Save(onlineAlert))
+
+	initialEmailCount := hub.TestMailer.TotalSend()
+	am := alerts.NewTestAlertManagerWithoutWorker(hub)
+
+	require.NoError(t, am.HandleStatusAlerts("up", system))
+	require.Eventually(t, func() bool {
+		return hub.TestMailer.TotalSend() == initialEmailCount+1
+	}, time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, initialEmailCount+1, hub.TestMailer.TotalSend(), "zero-minute online alerts should send immediately")
+
+	alertRecord, err := hub.FindRecordById("alerts", downAlert.Id)
+	require.NoError(t, err)
+	assert.False(t, alertRecord.GetBool("triggered"), "down alert should resolve when the system comes back up")
+}
+
+func TestStatusAlertOnlineOnlyNotificationDoesNotDependOnDownAlert(t *testing.T) {
+	hub, user := beszelTests.GetHubWithUser(t)
+	defer hub.Cleanup()
+
+	userSettings, err := hub.FindFirstRecordByFilter("user_settings", "user={:user}", map[string]any{"user": user.Id})
+	require.NoError(t, err)
+	userSettings.Set("settings", `{"emails":["test@example.com"],"webhooks":[]}`)
+	require.NoError(t, hub.Save(userSettings))
+
+	systemCollection, err := hub.FindCollectionByNameOrId("systems")
+	require.NoError(t, err)
+	system := core.NewRecord(systemCollection)
+	system.Set("name", "test-system")
+	system.Set("status", "up")
+	system.Set("host", "127.0.0.1")
+	system.Set("users", []string{user.Id})
+	require.NoError(t, hub.Save(system))
+
+	alertCollection, err := hub.FindCollectionByNameOrId("alerts")
+	require.NoError(t, err)
+	onlineAlert := core.NewRecord(alertCollection)
+	onlineAlert.Set("user", user.Id)
+	onlineAlert.Set("system", system.Id)
+	onlineAlert.Set("name", "StatusOnline")
+	onlineAlert.Set("value", 1)
+	onlineAlert.Set("min", 1)
+	require.NoError(t, hub.Save(onlineAlert))
+
+	initialEmailCount := hub.TestMailer.TotalSend()
+	am := alerts.NewTestAlertManagerWithoutWorker(hub)
+
+	system.Set("status", "down")
+	require.NoError(t, hub.Save(system))
+	require.NoError(t, am.HandleStatusAlerts("down", system))
+	assert.Zero(t, am.GetPendingAlertsCount(), "online-only alerts should not schedule a down notification")
+
+	system.Set("status", "up")
+	require.NoError(t, hub.Save(system))
+	require.NoError(t, am.HandleStatusAlerts("up", system))
+	assert.Equal(t, 1, am.GetPendingAlertsCount(), "online-only alerts should still schedule an online notification")
+
+	am.ForceExpirePendingAlerts()
+	processed, err := am.ProcessPendingAlerts()
+	require.NoError(t, err)
+	assert.Len(t, processed, 1, "online-only notification should be processable")
+	assert.Equal(t, initialEmailCount+1, hub.TestMailer.TotalSend(), "online-only alert should send after the configured delay")
 }
 
 func TestHandleStatusAlertsDoesNotSendRecoveryWhileDownIsOnlyPending(t *testing.T) {
@@ -303,6 +561,8 @@ func TestStatusAlertDownFiresAfterDelayExpires(t *testing.T) {
 	initialEmailCount := hub.TestMailer.TotalSend()
 	am := alerts.NewTestAlertManagerWithoutWorker(hub)
 
+	system.Set("status", "down")
+	require.NoError(t, hub.Save(system))
 	require.NoError(t, am.HandleStatusAlerts("down", system))
 	assert.Equal(t, 1, am.GetPendingAlertsCount(), "alert should be pending after system goes down")
 

@@ -10,12 +10,18 @@ import { ThermometerIcon, BatteryMediumIcon, HourglassIcon } from "@/components/
 /** Alert info for each alert type */
 export const alertInfo: Record<string, AlertInfo> = {
 	Status: {
-		name: () => t`Status`,
+		name: () => t`System Down`,
 		unit: "",
 		icon: ServerIcon,
-		desc: () => t`Triggers when status switches between up and down`,
+		desc: () => t`Triggers when a system goes down`,
 		/** "for x minutes" is appended to desc when only one value */
 		singleDesc: () => `${t`System`} ${t`Down`}`,
+	},
+	StatusOnline: {
+		name: () => t`System Online`,
+		unit: "",
+		icon: ServerIcon,
+		desc: () => t`Triggers when a system comes online`,
 	},
 	CPU: {
 		name: () => t`CPU Usage`,
